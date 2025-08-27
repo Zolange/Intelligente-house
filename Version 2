@@ -1,0 +1,252 @@
+// Intelligente House with Esp32
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <LiquidCrystal_I2C.h>
+#include "DHT.h"
+#include <SPI.h>
+#include <MFRC522.h>
+#include <ESP32Servo.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// === Crédentials AP (Hotspot de l'ESP32) ===
+const char* ssid = "ESP32_Hotspot";
+const char* password = "12345678";
+
+// === Création serveur Web sur port 80 ===
+WebServer server(80);
+
+// === LCD ===
+LiquidCrystal_I2C lcd(0x27, 16, 2);  
+
+// === DHT11 ===
+#define DHTPIN 33
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// === Infrarouge ===
+#define IR_PIN 34
+#define SERVO_IR_PIN 14
+Servo servoIR;
+
+// === Capteurs / Actionneurs ===
+const int mq2Pin = 32;
+const int relaisPin = 25;
+const int buzzerPin = 26;  // Changé pour éviter tout conflit
+const int pirPin = 12;
+
+// === RFID RC522 ===
+#define SS_PIN 5
+#define RST_PIN 4
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+
+// === Servo RFID ===
+Servo servoRFID;
+
+// === Servo et relais via WiFi ===
+Servo servoWiFi;
+const int RELAY_WIFI_PIN = 23;
+
+// === Seuils / UID autorisé ===
+int seuil = 1000;
+byte badgeAutorise[] = {0xEF, 0x6C, 0xE9, 0x1E};
+
+// === Variables de timing ===
+unsigned long previousMillis = 0;
+const long interval = 1000;
+bool lastRFIDState = false;
+bool alarmeActive = false;
+unsigned long alarmeStartTime = 0;
+const long alarmeDuration = 5000;
+
+// ==== Vérif UID ====
+bool verifierBadge(byte *uid, byte taille) {
+  if (taille != sizeof(badgeAutorise)) return false;
+  for (byte i = 0; i < taille; i++) {
+    if (uid[i] != badgeAutorise[i]) return false;
+  }
+  return true;
+}
+
+// === Pages Web ===
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><title>ESP32 Control</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial,sans-serif;margin:40px;background:#f0f0f0;}";
+  html += "button{padding:15px 25px;margin:10px;font-size:16px;border-radius:8px;border:none;cursor:pointer;}";
+  html += ".on{background:#4CAF50;color:white;} .off{background:#f44336;color:white;}</style></head><body>";
+  html += "<h1>Contrôle Maison Intelligente</h1>";
+  html += "<p><a href=\"/servo/on\"><button class=\"on\">Servo ON</button></a>";
+  html += "<a href=\"/servo/off\"><button class=\"off\">Servo OFF</button></a></p>";
+  html += "<p><a href=\"/relais/on\"><button class=\"on\">Relais ON</button></a>";
+  html += "<a href=\"/relais/off\"><button class=\"off\">Relais OFF</button></a></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleServoOn() {
+  servoWiFi.write(90);
+  server.sendHeader("Location", "/"); 
+  server.send(303);
+}
+
+void handleServoOff() {
+  servoWiFi.write(0);
+  server.sendHeader("Location", "/"); 
+  server.send(303);
+}
+
+void handleRelaisOn() {
+  digitalWrite(RELAY_WIFI_PIN, HIGH);
+  server.sendHeader("Location", "/"); 
+  server.send(303);
+}
+
+void handleRelaisOff() {
+  digitalWrite(RELAY_WIFI_PIN, LOW);
+  server.sendHeader("Location", "/"); 
+  server.send(303);
+}
+
+// === Setup ===
+void setup() {
+  Serial.begin(115200);
+
+  // Initialisation des broches
+  pinMode(relaisPin, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(pirPin, INPUT);
+  pinMode(IR_PIN, INPUT);
+
+  // États initiaux
+  digitalWrite(relaisPin, LOW);
+  digitalWrite(buzzerPin, LOW);
+
+  dht.begin();
+
+  // Servos
+  servoIR.attach(SERVO_IR_PIN);
+  servoIR.write(0);
+  servoRFID.attach(13);
+  servoRFID.write(0);
+  servoWiFi.attach(15);
+  servoWiFi.write(0);
+  
+  pinMode(RELAY_WIFI_PIN, OUTPUT);
+  digitalWrite(RELAY_WIFI_PIN, LOW);
+
+  // SPI + RC522
+  SPI.begin();
+  mfrc522.PCD_Init();
+
+  // LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0,0);
+  lcd.print("Systeme Prêt");
+  delay(1500);
+  lcd.clear();
+
+  // WiFi Hotspot
+  WiFi.softAP(ssid, password);
+  Serial.print("Hotspot actif : ");
+  Serial.println(WiFi.softAPIP());
+  
+  server.on("/", handleRoot);
+  server.on("/servo/on", handleServoOn);
+  server.on("/servo/off", handleServoOff);
+  server.on("/relais/on", handleRelaisOn);
+  server.on("/relais/off", handleRelaisOff);
+  
+  server.begin();
+  Serial.println("Serveur web démarré");
+}
+
+// === Loop ===
+void loop() {
+  server.handleClient();
+
+  unsigned long currentMillis = millis();
+
+  // Lecture des capteurs à intervalle régulier
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+    // Lectures capteurs
+    int valeurMQ2 = analogRead(mq2Pin);
+    int mouvement = digitalRead(pirPin);
+    float humidite = dht.readHumidity();
+    float temperature = dht.readTemperature();
+
+    // Vérification des lectures DHT
+    if (isnan(humidite) || isnan(temperature)) {
+      Serial.println("Erreur lecture DHT!");
+      humidite = 0;
+      temperature = 0;
+    }
+
+    // Détection feu avec gestion temporelle
+    if (valeurMQ2 > seuil && !alarmeActive) {
+      Serial.println("🔥 Feu detecte !");
+      digitalWrite(relaisPin, HIGH);
+      digitalWrite(buzzerPin, HIGH);
+      alarmeActive = true;
+      alarmeStartTime = currentMillis;
+      
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print("ALARME INCENDIE!");
+      lcd.setCursor(0,1);
+      lcd.print("EVACUATION");
+    }
+
+    // Désactivation alarme après 5 secondes
+    if (alarmeActive && (currentMillis - alarmeStartTime >= alarmeDuration)) {
+      digitalWrite(relaisPin, LOW);
+      digitalWrite(buzzerPin, LOW);
+      alarmeActive = false;
+    }
+
+    // Affichage LCD (sauf pendant alarme)
+    if (!alarmeActive) {
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print("T:");
+      lcd.print(temperature, 1);
+      lcd.print("C H:");
+      lcd.print(humidite, 0);
+      lcd.print("%");
+
+      lcd.setCursor(0,1);
+      lcd.print("PIR:");
+      lcd.print(mouvement ? "OUI" : "NON");
+      lcd.print(" MQ:");
+      lcd.print(valeurMQ2);
+    }
+  }
+
+  // RFID - lecture non bloquante
+  if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+    if (verifierBadge(mfrc522.uid.uidByte, mfrc522.uid.size)) {
+      Serial.println("Badge autorise ✅ : Ouverture porte");
+      servoRFID.write(90);
+      delay(2000);
+      servoRFID.write(0);
+    } else {
+      Serial.println("Acces refuse ❌ !");
+      digitalWrite(buzzerPin, HIGH);
+      delay(500);
+      digitalWrite(buzzerPin, LOW);
+    }
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+  }
+
+  // Capteur IR
+  if (digitalRead(IR_PIN) == LOW) {
+    Serial.println("Obstacle detecte → Servo IR");
+    servoIR.write(90);
+    delay(2000);
+    servoIR.write(0);
+  }
+}
